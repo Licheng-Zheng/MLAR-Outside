@@ -1,85 +1,149 @@
-Model On Hugging Face: https://huggingface.co/Licheng-Zheng/NER-BIO-BERT
+---
+license: apache-2.0
+---
 
 **Intended Use & Limitations:** For extracting entities from biomedical literature, should not be used for clinical purposes as there are many flaws in the training data. 
 
-#### How to Use 
-**PubMedBERT CRF Custom Class** (required for loading in the CRF layer on top of the BERT model)
-```py
+#### Example Input and Output
+ex. 1 
+Input: 'Patients with severe rheumatoid arthritis were treated with infliximab to target TNF-alpha.'
 
+Output: 
+CONDITION       | rheumatoid arthritis
+TREATMENT       | infliximab
+MOLECULE        | tnf - alpha
+
+ex. 2
+Text: 'Chemotherapy is a systemic treatment that targets rapidly dividing cells, affecting both cancer and healthy cells like those in hair follicles.'
+
+Output
+TREATMENT       | chemotherapy
+LOCATION        | hair follicles
+
+ex. 3
+Input: 'The medication works by mimicking the GLP-1 hormone, which stimulates insulin secretion, slows gastric emptying, and reduces appetite. Common side effects include nausea, vomiting, diarrhea, and abdominal pain. The drug carries a boxed warning regarding the risk of thyroid C-cell tumors observed in rodent studies.'
+
+Output:
+MOLECULE        | glp - 1 hormone
+
+ex. 4
+Input: 'GLP-1 receptors are also found in the heart, kidneys, lungs, and adipose tissue, where activation may contribute to cardiovascular protection, improved metabolic function, and enhanced fat oxidation.  The drug's structural modifications allow it to resist degradation by the DPP-4 enzyme, enabling once-weekly dosing while maintaining continuous receptor activation across these diverse cell types.'
+
+Output:
+RECEPTOR        | glp - 1 receptors
+LOCATION        | heart
+LOCATION        | kidneys
+LOCATION        | lungs
+LOCATION        | adipose tissue
+MOLECULE        | dpp - 4
+
+#### How to Use 
+```py
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+from torchcrf import CRF
+
+# 1. Define the label mappings (Required for the model to understand outputs)
+label2id = {
+    "O": 0,
+    "B-CELL_FUNCTION": 1, "I-CELL_FUNCTION": 2, "L-CELL_FUNCTION": 3, "U-CELL_FUNCTION": 4,
+    "B-CELL_TYPE": 5, "I-CELL_TYPE": 6, "L-CELL_TYPE": 7, "U-CELL_TYPE": 8,
+    "B-CONDITION": 9, "I-CONDITION": 10, "L-CONDITION": 11, "U-CONDITION": 12,
+    "B-LOCATION": 13, "I-LOCATION": 14, "L-LOCATION": 15, "U-LOCATION": 16,
+    "B-MOLECULE": 17, "I-MOLECULE": 18, "L-MOLECULE": 19, "U-MOLECULE": 20,
+    "B-PATHOGEN": 21, "I-PATHOGEN": 22, "L-PATHOGEN": 23, "U-PATHOGEN": 24,
+    "B-PROCESS": 25, "I-PROCESS": 26, "L-PROCESS": 27, "U-PROCESS": 28,
+    "B-RECEPTOR": 29, "I-RECEPTOR": 30, "L-RECEPTOR": 31, "U-RECEPTOR": 32,
+    "B-TREATMENT": 33, "I-TREATMENT": 34, "L-TREATMENT": 35, "U-TREATMENT": 36,
+    "B-VISUAL_PROPERTY": 37, "I-VISUAL_PROPERTY": 38, "L-VISUAL_PROPERTY": 39, "U-VISUAL_PROPERTY": 40
+}
+id2label = {v: k for k, v in label2id.items()}
+
+# 2. Define the Custom Architecture
 class PubMedBertCRF(nn.Module):
     def __init__(self, model_checkpoint, num_labels):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_checkpoint)
-        self.config = self.bert.config
+        self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
+        self.crf = CRF(num_tags=num_labels, batch_first=True)
 
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(self.config.hidden_size, num_labels)
-        self.crf = CRF(num_tags=len(label2id), batch_first=True)
-
-    def forward(self, input_ids, attention_mask, labels=None, **kwargs):
+    def forward(self, input_ids, attention_mask, **kwargs):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = self.dropout(outputs.last_hidden_state)
-        emissions = self.classifier(sequence_output)
+        emissions = self.classifier(outputs.last_hidden_state)
+        return emissions
 
-        if labels is not None:
-            crf_mask = attention_mask.bool()
-            crf_mask[:, 0] = True 
-            
-            safe_labels = torch.where(labels == -100, torch.tensor(0, device=labels.device), labels)
-            log_likelihood = self.crf(emissions, safe_labels, mask=crf_mask, reduction='mean')
-            loss = -log_likelihood
-            return (loss, emissions)
-        else:
-            return emissions
-```
-
-**Test Script** 
-```py
-import torch
-from transformers import AutoTokenizer
-# Assuming PubMedBertCRF and label2id/id2label are defined in your script...
-
+# 3. The Clean Inference Function
 def predict_entities(text, model, tokenizer, device="cuda"):
     model.eval()
     model.to(device)
     
-    # 1. Tokenize the input text
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
     with torch.no_grad():
-        # 2. Get emissions from BERT + Linear layer
         emissions = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
-        
-        # 3. Decode using the CRF
         mask = inputs["attention_mask"].bool()
-        mask[:, 0] = True # Safety catch
+        mask[:, 0] = True 
         predictions = model.crf.decode(emissions, mask=mask)[0]
         
-    # 4. Map back to words
     tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-    results = []
     
-    for token, pred_id in zip(tokens, predictions):
-        if token not in ["[CLS]", "[SEP]", "[PAD]"]:
-            label = id2label[pred_id]
-            if label != "O":
-                results.append((token, label))
-                
-    return results
+    # Post-processing: Stitch subwords (##) back together and group spans
+    entities = []
+    current_word = ""
+    current_label = None
 
-# --- Test it out ---
+    for token, pred_id in zip(tokens, predictions):
+        if token in ["[CLS]", "[SEP]", "[PAD]"]: 
+            continue
+            
+        label = id2label[pred_id]
+        clean_token = token.replace("##", "")
+
+        if label.startswith("B-") or label.startswith("U-"):
+            if current_word:
+                entities.append((current_word, current_label))
+            current_word = clean_token
+            current_label = label.split("-")[1]
+            
+        elif label.startswith("I-") or label.startswith("L-"):
+            # Attach subwords without spaces, normal words with spaces
+            if token.startswith("##"):
+                current_word += clean_token
+            else:
+                current_word += " " + clean_token
+                
+        else: # "O" tag
+            if current_word:
+                entities.append((current_word, current_label))
+                current_word = ""
+                current_label = None
+
+    # Catch the last entity if the sentence ends on one
+    if current_word:
+        entities.append((current_word, current_label))
+        
+    return entities
+
+# --- 4. Execution ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Loading model to {device}...")
+
 tokenizer = AutoTokenizer.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext")
 model = PubMedBertCRF("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext", num_labels=len(label2id))
 
-# Load your trained weights
-model.load_state_dict(torch.load("best_pubmedbert_crf_model.pt"))
+# Load weights securely, mapping to whatever device is available
+model.load_state_dict(torch.load("best_pubmedbert_crf_model.pt", map_location=torch.device(device), weights_only=True))
 
 test_sentence = "Patients with severe rheumatoid arthritis were treated with infliximab to target TNF-alpha."
-entities = predict_entities(test_sentence, model, tokenizer)
+print(f"\nAnalyzing: '{test_sentence}'\n")
+print("-" * 40)
 
-for token, label in entities:
-    print(f"{token:<15} : {label}")
+entities = predict_entities(test_sentence, model, tokenizer, device)
+
+for word, label in entities:
+    print(f"{label:<15} | {word}")
 ```
 
 #### Model Description 
