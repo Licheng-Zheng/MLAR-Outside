@@ -310,7 +310,7 @@ Semantic Errors (Type mismatches)   : 104
 OVERALL F1         | 0.7426   
 NER DIAGNOSTICS (Across 1500 Sentences)
 Structural Errors (BILOU violations): 7
-Semantic Errors (Type mismatches)   : 134
+ Semantic Errors (Type mismatches)   : 134
 
 OVERALL F1         | 0.7377   
 NER DIAGNOSTICS (Across 1500 Sentences)
